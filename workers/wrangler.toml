@@ -1,26 +1,15 @@
 name = "delay-mirror"
 main = "worker.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-23"
 
 [vars]
 DELAY_DAYS = "3"
-
-# NPM: 元数据源 vs 下载源
 NPM_REGISTRY = "https://registry.npmmirror.com"
 NPM_DOWNLOAD_REGISTRY = "https://registry.npmjs.org"
-
-# Go Modules: 元数据源 vs 下载源
-GOMOD_REGISTRY = "https://mirrors.aliyun.com/goproxy/"
-GOMOD_DOWNLOAD_REGISTRY = "https://proxy.golang.org"
-
-# PyPI: Simple API / JSON API (元数据) vs 文件下载源
-PYPI_REGISTRY = "https://pypi.org/simple/"
+GOMOD_REGISTRY = "https://goproxy.cn"
+GOMOD_DOWNLOAD_REGISTRY = "https://goproxy.cn"
+PYPI_SIMPLE_INDEX = "https://mirrors.aliyun.com/pypi/simple"
 PYPI_JSON_API_BASE = "https://pypi.org/pypi"
 PYPI_DOWNLOAD_BASE = "https://files.pythonhosted.org/packages"
-
+PYPI_DOWNLOAD_MIRROR = "https://mirrors.aliyun.com/pypi/packages"
 ALLOWLIST_ENABLED = "false"
-
-# Uncomment and configure for your custom domain:
-# [[routes]]
-# pattern = "your-domain.example.com"
-# custom_domain = true

@@ -1,11 +1,12 @@
 import initWasm from "./pkg/delay_mirror.js";
-import wasmModule from "./pkg/delay_mirror_bg.wasm";
+import wasmUrl from "./pkg/delay_mirror_bg.wasm";
 
 let wasmInstance = null;
 
 async function ensureInitialized() {
   if (!wasmInstance) {
-    wasmInstance = await initWasm(wasmModule);
+    const wasmResponse = await fetch(wasmUrl);
+    wasmInstance = await initWasm(await wasmResponse.arrayBuffer());
   }
   return wasmInstance;
 }

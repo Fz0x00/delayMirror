@@ -1,9 +1,6 @@
 name: Deploy to Cloudflare Workers
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -11,7 +8,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  WASM_PACK_VERSION: "0.13.1"
 
 jobs:
   deploy:
@@ -29,12 +25,18 @@ jobs:
           key: wasm32-workers
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: ${{ env.WASM_PACK_VERSION }}
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Build WASM
-        run: wasm-pack build --target nodejs --out-dir workers/pkg --out-name delay_mirror --release --features workers
+        run: |
+          wasm-pack build \
+            --target no-modules \
+            --out-dir workers/pkg \
+            --out-name delay_mirror \
+            --release \
+            --features workers
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
