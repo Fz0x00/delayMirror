@@ -1,0 +1,16 @@
+target/
+*.wasm
+worker/
+.wrangler/
+.wrangler-home/
+node_modules/
+.specs/
+workers/pkg/
+pkg/
+
+# Test temp files
+test/npm/tmp-*/
+test/pip/__pycache__/
+test/pip/*.egg-info/
+test/gomod/go.mod
+test/gomod/go.sum

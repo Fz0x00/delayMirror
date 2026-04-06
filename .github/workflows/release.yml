@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-server:
+    name: Build Server (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        name: Determine version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-release
+
+      - name: Install cross-compiler for arm64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure cargo for arm64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p ~/.cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Build Release Binary
+        run: cargo build --release --features server --target ${{ matrix.target }}
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/delay-mirror-server dist/
+          cp README.md dist/
+          cp LICENSE dist/
+          cd dist
+          tar -czvf ../delay-mirror-server-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: delay-mirror-server-linux-${{ matrix.arch }}
+          path: delay-mirror-server-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG="## ${{ steps.version.outputs.version }} (Initial Release)
+
+          ### Added
+          - Initial open source release of Delay Mirror
+          - NPM / Go Modules / PyPI proxy support
+          - Time-based delay security policy
+          - Allowlist mechanism
+          - Structured audit logging
+          - Dual deployment: Cloudflare Workers + Standalone Server
+
+          ### Installation
+
+          Download the binary for your platform:
+          - \`delay-mirror-server-*-linux-amd64.tar.gz\` - Linux x86_64
+          - \`delay-mirror-server-*-linux-arm64.tar.gz\` - Linux ARM64
+
+          ### Usage
+
+          \`\`\`bash
+          # Extract and run
+          tar -xzf delay-mirror-server-*-linux-*.tar.gz
+          ./delay-mirror-server
+          \`\`\`
+
+          ### Cloudflare Workers Deployment
+
+          For Cloudflare Workers deployment, please build from source:
+
+          \`\`\`bash
+          wasm-pack build --target nodejs --out-dir pkg --out-name delay_mirror --release
+          cd workers && npx wrangler deploy
+          \`\`\`"
+          else
+            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+            CHANGELOG="## ${{ steps.version.outputs.version }}
+
+          ### Changes
+          ${CHANGELOG}"
+          fi
+          echo "${CHANGELOG}" > /tmp/changelog.md
+          cat /tmp/changelog.md
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: delay-mirror-server-*
+          path: ./release-artifacts
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: ls -la ./release-artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Delay Mirror ${{ steps.version.outputs.version }}
+          body_path: /tmp/changelog.md
+          draft: false
+          prerelease: false
+          files: ./release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
