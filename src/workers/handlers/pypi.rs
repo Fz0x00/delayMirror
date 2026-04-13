@@ -73,8 +73,19 @@ fn parse_sdist_filename(filename: &str) -> Option<(String, String)> {
 async fn fetch_pypi_release_info(
     package: &str,
     json_api_base: &str,
+    cache: Option<&MetadataCache>,
 ) -> std::result::Result<Value, Response> {
     let normalized = normalize_package_name(package);
+    
+    // 检查缓存
+    if let Some(cache) = cache {
+        if let Ok(true) = cache.is_valid(&normalized, 24) { // 24小时缓存
+            if let Ok(Some(metadata)) = cache.get(&normalized) {
+                return Ok(metadata.metadata);
+            }
+        }
+    }
+    
     let url = format!("{}/{}/json", json_api_base, normalized);
 
     let req = match Request::new(&url, Method::Get) {
@@ -134,6 +145,11 @@ async fn fetch_pypi_release_info(
             .unwrap_or_else(|_| Response::error("Internal Server Error", 500).unwrap()));
         }
     };
+    
+    // 存储到缓存
+    if let Some(cache) = cache {
+        let _ = cache.set(&normalized, &metadata);
+    }
 
     Ok(metadata)
 }
@@ -236,8 +252,9 @@ pub async fn handle_pypi_package_list(
     config: &Config,
     checker: &DelayChecker,
     package: &str,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
-    match handle_pypi_package_list_inner(_req, config, checker, package).await {
+    match handle_pypi_package_list_inner(_req, config, checker, package, cache).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             let err_msg = format!("PyPI package list error for {}: {:?}", package, e);
@@ -253,6 +270,7 @@ async fn handle_pypi_package_list_inner(
     config: &Config,
     checker: &DelayChecker,
     package: &str,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
     let normalized_package = normalize_package_name(package);
 
@@ -284,7 +302,7 @@ async fn handle_pypi_package_list_inner(
         Err(e) => return Err(format!("Failed to read upstream response: {}", e).into()),
     };
 
-    let release_info = fetch_pypi_release_info(package, &config.pypi_json_api_base).await;
+    let release_info = fetch_pypi_release_info(package, &config.pypi_json_api_base, cache).await;
 
     let recent_versions_warning = match release_info {
         Ok(info) => {
@@ -361,6 +379,7 @@ pub async fn handle_pypi_download(
     checker: &DelayChecker,
     logger: &DelayLogger,
     filename: &str,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
     let (package, version) = match parse_package_filename(filename) {
         Some(result) => result,
@@ -374,7 +393,7 @@ pub async fn handle_pypi_download(
 
     let client_ip = _req.headers().get("CF-Connecting-IP").ok().flatten();
 
-    let metadata = match fetch_pypi_release_info(&package, &config.pypi_json_api_base).await {
+    let metadata = match fetch_pypi_release_info(&package, &config.pypi_json_api_base, cache).await {
         Ok(m) => m,
         Err(resp) => return Ok(resp),
     };

@@ -4,6 +4,7 @@ use worker::{Headers, Method, Request, Response};
 use crate::core::delay_logger::DelayLogger;
 use crate::core::Config;
 use crate::core::DelayChecker;
+use crate::core::MetadataCache;
 
 type HandlerResult = worker::Result<Response>;
 
@@ -76,6 +77,9 @@ fn api_index() -> HandlerResult {
 }
 
 pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker) -> HandlerResult {
+    // 创建缓存实例
+    let cache = MetadataCache::new("metadata_cache.db").ok();
+    
     if req.method() != Method::Get && req.method() != Method::Head {
         return make_json_response(
             405,
@@ -268,7 +272,7 @@ pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker
         return make_json_response(200, results);
     }
 
-    let result = dispatch(&req, path, config, checker).await;
+    let result = dispatch(&req, path, config, checker, cache.as_ref()).await;
     match result {
         Some(resp) => add_cors_headers(resp),
         None => {
@@ -305,6 +309,7 @@ async fn dispatch(
     path: &str,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Option<HandlerResult> {
     let parts: Vec<&str> = path.split('/').collect();
 
@@ -315,7 +320,7 @@ async fn dispatch(
     match parts[0] {
         "npm" | "dl" => dispatch_npm(req, &parts, config, checker).await,
         "gomod" => dispatch_gomod(req, &parts, config, checker).await,
-        "pypi" => dispatch_pypi(req, &parts, config, checker).await,
+        "pypi" => dispatch_pypi(req, &parts, config, checker, cache).await,
         _ => None,
     }
 }
@@ -376,6 +381,7 @@ async fn dispatch_pypi(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Option<HandlerResult> {
     if parts.len() == 1 || (parts.len() == 2 && parts[1] == "simple") {
         return Some(super::handlers::pypi::handle_pypi_simple_index(config).await);
@@ -385,7 +391,7 @@ async fn dispatch_pypi(
         let package = parts[2];
         let req = req.clone().ok()?;
         return Some(
-            super::handlers::pypi::handle_pypi_package_list(req, config, checker, package).await,
+            super::handlers::pypi::handle_pypi_package_list(req, config, checker, package, cache).await,
         );
     }
 
@@ -394,7 +400,7 @@ async fn dispatch_pypi(
         let req = req.clone().ok()?;
         let logger = DelayLogger::new();
         return Some(
-            super::handlers::pypi::handle_pypi_download(req, config, checker, &logger, &filename)
+            super::handlers::pypi::handle_pypi_download(req, config, checker, &logger, &filename, cache)
                 .await,
         );
     }
