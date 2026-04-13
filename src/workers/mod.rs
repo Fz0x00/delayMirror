@@ -17,5 +17,5 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         env.var(key).ok().map(|v| v.to_string())
     });
     let checker = DelayChecker::new(config.delay_days);
-    route_request(req, &config, &checker).await
+    route_request(req, &config, &checker, &env).await
 }

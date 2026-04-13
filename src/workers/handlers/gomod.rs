@@ -182,10 +182,12 @@ async fn check_version_with_delay(
     
     // 存储到缓存
     if let Some(cache) = cache {
-        let cache_data = serde_json::json!({
-            "version": version_info.Version,
-            "time": version_info.Time
-        });
+        let cache_data = serde_json::json!(
+            {
+                "version": version_info.Version,
+                "time": version_info.Time
+            }
+        );
         let _ = cache.set(&cache_key, &cache_data);
     }
 

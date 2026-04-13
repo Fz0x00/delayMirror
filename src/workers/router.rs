@@ -1,11 +1,12 @@
 use serde_json::json;
-use worker::{Headers, Method, Request, Response};
+use worker::{Headers, Method, Request, Response, Env};
 
 use crate::core::delay_logger::DelayLogger;
 use crate::core::Config;
 use crate::core::DelayChecker;
 use crate::core::MetadataCache;
 use crate::core::InMemoryMetadataCache;
+use crate::core::KVMetadataCache;
 
 type HandlerResult = worker::Result<Response>;
 
@@ -77,9 +78,18 @@ fn api_index() -> HandlerResult {
     )
 }
 
-pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker) -> HandlerResult {
+pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker, env: &Env) -> HandlerResult {
     // 创建缓存实例
-    let cache: Option<&dyn MetadataCache> = Some(&InMemoryMetadataCache::new());
+    let cache: Box<dyn MetadataCache> = if let Ok(kv_namespace) = env.var("KV_NAMESPACE") {
+        if let Ok(kv) = env.kv(kv_namespace.to_string().as_str()) {
+            Box::new(KVMetadataCache::new(kv, "metadata_cache"))
+        } else {
+            Box::new(InMemoryMetadataCache::new())
+        }
+    } else {
+        Box::new(InMemoryMetadataCache::new())
+    };
+    let cache: Option<&dyn MetadataCache> = Some(&*cache);
     
     if req.method() != Method::Get && req.method() != Method::Head {
         return make_json_response(
@@ -273,7 +283,7 @@ pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker
         return make_json_response(200, results);
     }
 
-    let result = dispatch(&req, path, config, checker, cache.as_ref()).await;
+    let result = dispatch(&req, path, config, checker, cache).await;
     match result {
         Some(resp) => add_cors_headers(resp),
         None => {
@@ -331,7 +341,7 @@ async fn dispatch_npm(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Option<HandlerResult> {
     let req = req.clone().ok()?;
 
@@ -355,7 +365,7 @@ async fn dispatch_gomod(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Option<HandlerResult> {
     let req = req.clone().ok()?;
     let last = parts.last()?;
@@ -384,7 +394,7 @@ async fn dispatch_pypi(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Option<HandlerResult> {
     if parts.len() == 1 || (parts.len() == 2 && parts[1] == "simple") {
         return Some(super::handlers::pypi::handle_pypi_simple_index(config).await);

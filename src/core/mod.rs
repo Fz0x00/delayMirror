@@ -8,6 +8,8 @@ pub use cache::{MetadataCache, PackageMetadata};
 pub use cache::SqliteMetadataCache;
 #[cfg(feature = "workers")]
 pub use cache::InMemoryMetadataCache;
+#[cfg(feature = "workers")]
+pub use cache::KVMetadataCache;
 pub use config::Config;
 pub use delay_check::{DelayCheckError, DelayChecker, VersionCheckResult};
 pub use delay_logger::{DelayAction, DelayLogEntry, DelayLogger, PackageType};

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc, Duration};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PackageMetadata {
     pub package_name: String,
     pub metadata: Value,
@@ -99,6 +99,8 @@ pub mod workers {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use worker::{*, kv::KvStore};
+    use futures::executor::block_on;
 
     pub struct InMemoryMetadataCache {
         cache: Mutex<HashMap<String, PackageMetadata>>,
@@ -113,12 +115,12 @@ pub mod workers {
     }
 
     impl MetadataCache for InMemoryMetadataCache {
-        fn get(&self, package_name: &str) -> Result<Option<PackageMetadata>, Box<dyn std::error::Error>> {
+        fn get(&self, package_name: &str) -> std::result::Result<Option<PackageMetadata>, Box<dyn std::error::Error>> {
             let cache = self.cache.lock().unwrap();
             Ok(cache.get(package_name).cloned())
         }
 
-        fn set(&self, package_name: &str, metadata: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        fn set(&self, package_name: &str, metadata: &Value) -> std::result::Result<(), Box<dyn std::error::Error>> {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(
                 package_name.to_string(),
@@ -131,7 +133,7 @@ pub mod workers {
             Ok(())
         }
 
-        fn is_valid(&self, package_name: &str, max_age_hours: i64) -> Result<bool, Box<dyn std::error::Error>> {
+        fn is_valid(&self, package_name: &str, max_age_hours: i64) -> std::result::Result<bool, Box<dyn std::error::Error>> {
             if let Some(metadata) = self.get(package_name)? {
                 let max_age = Duration::hours(max_age_hours);
                 let now = Utc::now();
@@ -141,12 +143,73 @@ pub mod workers {
             }
         }
 
-        fn cleanup(&self, max_age_hours: i64) -> Result<usize, Box<dyn std::error::Error>> {
+        fn cleanup(&self, max_age_hours: i64) -> std::result::Result<usize, Box<dyn std::error::Error>> {
             let mut cache = self.cache.lock().unwrap();
             let cutoff_time = Utc::now() - Duration::hours(max_age_hours);
             let initial_len = cache.len();
             cache.retain(|_, v| v.last_updated >= cutoff_time);
             Ok(initial_len - cache.len())
+        }
+    }
+
+    pub struct KVMetadataCache {
+        kv: KvStore,
+        namespace: String,
+    }
+
+    impl KVMetadataCache {
+        pub fn new(kv: KvStore, namespace: &str) -> Self {
+            Self {
+                kv,
+                namespace: namespace.to_string(),
+            }
+        }
+    }
+
+    impl MetadataCache for KVMetadataCache {
+        fn get(&self, package_name: &str) -> std::result::Result<Option<PackageMetadata>, Box<dyn std::error::Error>> {
+            let key = format!("{}/{}", self.namespace, package_name);
+            block_on(async move {
+                match self.kv.get(&key).text().await {
+                    Ok(Some(value)) => {
+                        let metadata: PackageMetadata = serde_json::from_str(&value)?;
+                        Ok(Some(metadata))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+                }
+            })
+        }
+
+        fn set(&self, package_name: &str, metadata: &Value) -> std::result::Result<(), Box<dyn std::error::Error>> {
+            let key = format!("{}/{}", self.namespace, package_name);
+            let package_metadata = PackageMetadata {
+                package_name: package_name.to_string(),
+                metadata: metadata.clone(),
+                last_updated: Utc::now(),
+            };
+            let json_str = serde_json::to_string(&package_metadata)?;
+            block_on(async move {
+                match self.kv.put(&key, json_str) {
+                    Ok(builder) => builder.execute().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
+                    Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+                }
+            })
+        }
+
+        fn is_valid(&self, package_name: &str, max_age_hours: i64) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+            if let Some(metadata) = self.get(package_name)? {
+                let max_age = Duration::hours(max_age_hours);
+                let now = Utc::now();
+                Ok(now.signed_duration_since(metadata.last_updated) <= max_age)
+            } else {
+                Ok(false)
+            }
+        }
+
+        fn cleanup(&self, _max_age_hours: i64) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+            // KV 存储没有直接的批量清理方法，这里返回 0 表示不支持清理
+            Ok(0)
         }
     }
 }
@@ -156,3 +219,6 @@ pub use server::SqliteMetadataCache;
 
 #[cfg(feature = "workers")]
 pub use workers::InMemoryMetadataCache;
+
+#[cfg(feature = "workers")]
+pub use workers::KVMetadataCache;
