@@ -20,43 +20,8 @@ fn get_base_url(req: &Request) -> String {
 }
 
 async fn proxy_upstream(url: &str, extra_headers: Option<&Headers>) -> worker::Result<Response> {
-    let mut upstream_req = Request::new(url, worker::Method::Get)?;
-    upstream_req
-        .headers_mut()?
-        .set("Accept", "application/octet-stream, */*")?;
-
-    let mut upstream_resp = match Fetch::Request(upstream_req).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::error(format!("Upstream fetch failed: {}", e), 502);
-        }
-    };
-
-    let status = upstream_resp.status_code();
-    let body = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| worker::Error::RustError(e.to_string()))?;
-    let mut headers = Headers::new();
-    let has_extra = extra_headers.is_some();
-
-    if let Some(extra) = extra_headers {
-        for (name, value) in extra.entries() {
-            headers.set(&name, &value).ok();
-        }
-    }
-
-    // Add cache headers for better performance
-    headers.set("Cache-Control", "public, max-age=86400")?;
-
-    let mut resp = Response::from_bytes(body)?.with_status(status);
-    if has_extra {
-        resp = resp.with_headers(headers);
-    } else {
-        resp = resp.with_headers(headers);
-    }
-
-    Ok(resp)
+    // For bandwidth optimization, redirect to upstream instead of proxying
+    make_redirect_response(url, extra_headers)
 }
 
 #[allow(dead_code)]
