@@ -182,13 +182,17 @@ impl DelayChecker {
             return Ok(Some(requested_version.to_string()));
         }
 
-        let eligible: Vec<&String> = time_info
+        let eligible: Vec<(&String, &DateTime<Utc>)> = time_info
             .versions()
-            .filter(|v| {
+            .filter_map(|v| {
                 if let Some(t) = time_info.get_publish_time(v) {
-                    self.is_version_allowed(t)
+                    if self.is_version_allowed(t) {
+                        Some((v, t))
+                    } else {
+                        None
+                    }
                 } else {
-                    false
+                    None
                 }
             })
             .collect();
@@ -197,12 +201,18 @@ impl DelayChecker {
             return Ok(None);
         }
 
+        // 优先选择发布时间最接近阈值的版本
         let best = eligible
             .iter()
-            .max_by(|a, b| compare_versions(a, b))
+            .min_by(|a, b| {
+                // 比较版本的发布时间与阈值的接近程度
+                let a_diff = (*a.1 - self.threshold).num_seconds().abs();
+                let b_diff = (*b.1 - self.threshold).num_seconds().abs();
+                a_diff.cmp(&b_diff)
+            })
             .expect("eligible should not be empty");
 
-        Ok(Some((*best).clone()))
+        Ok(Some((*best.0).clone()))
     }
 
     pub fn resolve_version(
