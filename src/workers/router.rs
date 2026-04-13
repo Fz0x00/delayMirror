@@ -5,6 +5,7 @@ use crate::core::delay_logger::DelayLogger;
 use crate::core::Config;
 use crate::core::DelayChecker;
 use crate::core::MetadataCache;
+use crate::core::InMemoryMetadataCache;
 
 type HandlerResult = worker::Result<Response>;
 
@@ -78,7 +79,7 @@ fn api_index() -> HandlerResult {
 
 pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker) -> HandlerResult {
     // 创建缓存实例
-    let cache = MetadataCache::new("metadata_cache.db").ok();
+    let cache: Option<&dyn MetadataCache> = Some(&InMemoryMetadataCache::new());
     
     if req.method() != Method::Get && req.method() != Method::Head {
         return make_json_response(
@@ -309,7 +310,7 @@ async fn dispatch(
     path: &str,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Option<HandlerResult> {
     let parts: Vec<&str> = path.split('/').collect();
 

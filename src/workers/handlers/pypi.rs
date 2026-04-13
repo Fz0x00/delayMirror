@@ -5,7 +5,7 @@ use worker::*;
 
 use crate::core::delay_logger::{DelayLogger, PackageType};
 use crate::core::Config;
-use crate::core::{DelayCheckError, DelayChecker, VersionCheckResult};
+use crate::core::{DelayCheckError, DelayChecker, MetadataCache, VersionCheckResult};
 
 #[allow(dead_code)]
 const PYPI_JSON_API_BASE: &str = "https://pypi.org/pypi";
@@ -73,7 +73,7 @@ fn parse_sdist_filename(filename: &str) -> Option<(String, String)> {
 async fn fetch_pypi_release_info(
     package: &str,
     json_api_base: &str,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> std::result::Result<Value, Response> {
     let normalized = normalize_package_name(package);
     
@@ -252,7 +252,7 @@ pub async fn handle_pypi_package_list(
     config: &Config,
     checker: &DelayChecker,
     package: &str,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     match handle_pypi_package_list_inner(_req, config, checker, package, cache).await {
         Ok(resp) => Ok(resp),
@@ -270,7 +270,7 @@ async fn handle_pypi_package_list_inner(
     config: &Config,
     checker: &DelayChecker,
     package: &str,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     let normalized_package = normalize_package_name(package);
 
@@ -379,7 +379,7 @@ pub async fn handle_pypi_download(
     checker: &DelayChecker,
     logger: &DelayLogger,
     filename: &str,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     let (package, version) = match parse_package_filename(filename) {
         Some(result) => result,

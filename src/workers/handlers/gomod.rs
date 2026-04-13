@@ -115,7 +115,7 @@ async fn check_version_with_delay(
     version: &str,
     config: &Config,
     delay_checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<DelayCheckOutcome> {
     // 构建缓存键
     let cache_key = format!("gomod:{module}:{version}");
@@ -267,7 +267,7 @@ pub async fn handle_gomod_version_info(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
@@ -356,7 +356,7 @@ pub async fn handle_gomod_go_mod(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
@@ -468,7 +468,7 @@ pub async fn handle_gomod_download(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);

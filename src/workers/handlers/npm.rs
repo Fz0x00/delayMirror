@@ -4,7 +4,7 @@ use worker::{Fetch, Headers, Request, Response};
 
 use crate::core::delay_logger::{DelayLogger, PackageType};
 use crate::core::Config;
-use crate::core::{DelayCheckError, DelayChecker, VersionCheckResult, MetadataCache};
+use crate::core::{DelayCheckError, DelayChecker, MetadataCache, VersionCheckResult};
 
 fn get_base_url(req: &Request) -> String {
     let host = req
@@ -71,7 +71,7 @@ fn extract_version_from_filename(filename: &str) -> Option<String> {
     }
 }
 
-async fn fetch_package_metadata(package: &str, registry: &str, cache: Option<&MetadataCache>) -> Result<Value, Response> {
+async fn fetch_package_metadata(package: &str, registry: &str, cache: Option<&dyn MetadataCache>) -> Result<Value, Response> {
     // 检查缓存
     if let Some(cache) = cache {
         if let Ok(true) = cache.is_valid(package, 24) { // 24小时缓存
@@ -272,7 +272,7 @@ pub async fn handle_npm_metadata(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> worker::Result<Response> {
     let path = req.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -338,7 +338,7 @@ pub async fn handle_npm_version(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> worker::Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = req.headers().get("CF-Connecting-IP").ok().flatten();
@@ -475,7 +475,7 @@ pub async fn handle_npm_download(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
-    cache: Option<&MetadataCache>,
+    cache: Option<&dyn MetadataCache>,
 ) -> worker::Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = req.headers().get("CF-Connecting-IP").ok().flatten();
