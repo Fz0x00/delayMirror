@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use worker::*;
 
 use crate::core::{
-    Config, DelayAction, DelayChecker, DelayLogEntry, DelayLogger, PackageType, VersionCheckResult,
+    Config, DelayAction, DelayChecker, DelayLogEntry, DelayLogger, MetadataCache, PackageType, VersionCheckResult,
 };
 
 fn new_get_request(url: &str) -> Result<Request> {
@@ -115,7 +115,28 @@ async fn check_version_with_delay(
     version: &str,
     config: &Config,
     delay_checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Result<DelayCheckOutcome> {
+    // 构建缓存键
+    let cache_key = format!("gomod:{module}:{version}");
+    
+    // 检查缓存
+    if let Some(cache) = cache {
+        if let Ok(true) = cache.is_valid(&cache_key, 24) { // 24小时缓存
+            if let Ok(Some(metadata)) = cache.get(&cache_key) {
+                if let Some(publish_time_str) = metadata.metadata.get("time").and_then(|t| t.as_str()) {
+                    if let Ok(publish_time) = parse_version_time(publish_time_str) {
+                        if delay_checker.is_version_allowed(&publish_time) {
+                            return Ok(DelayCheckOutcome::Allowed);
+                        } else {
+                            return Ok(DelayCheckOutcome::Denied { publish_time });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     let escaped_module = escape_module_path(module);
     let url = format!(
         "{}/{}/@v/{}.info",
@@ -158,6 +179,15 @@ async fn check_version_with_delay(
     };
 
     let publish_time = parse_version_time(&version_info.Time)?;
+    
+    // 存储到缓存
+    if let Some(cache) = cache {
+        let cache_data = serde_json::json!({
+            "version": version_info.Version,
+            "time": version_info.Time
+        });
+        let _ = cache.set(&cache_key, &cache_data);
+    }
 
     if delay_checker.is_version_allowed(&publish_time) {
         Ok(DelayCheckOutcome::Allowed)
@@ -237,6 +267,7 @@ pub async fn handle_gomod_version_info(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
@@ -252,7 +283,7 @@ pub async fn handle_gomod_version_info(
     let version_with_ext = path_parts[path_parts.len() - 2];
     let version = version_with_ext.trim_end_matches(".info");
 
-    match check_version_with_delay(&module, version, config, checker).await? {
+    match check_version_with_delay(&module, version, config, checker, cache).await? {
         DelayCheckOutcome::Allowed => {
             logger.log(&DelayLogEntry::new(
                 PackageType::GoMod,
@@ -325,6 +356,7 @@ pub async fn handle_gomod_go_mod(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
@@ -340,7 +372,7 @@ pub async fn handle_gomod_go_mod(
     let version_with_ext = path_parts[path_parts.len() - 2];
     let version = version_with_ext.trim_end_matches(".mod");
 
-    match check_version_with_delay(&module, version, config, checker).await? {
+    match check_version_with_delay(&module, version, config, checker, cache).await? {
         DelayCheckOutcome::Allowed => {
             logger.log(&DelayLogEntry::new(
                 PackageType::GoMod,
@@ -436,6 +468,7 @@ pub async fn handle_gomod_download(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
@@ -451,7 +484,7 @@ pub async fn handle_gomod_download(
     let version_raw = path_parts[path_parts.len() - 2];
     let version_clean = version_raw.trim_end_matches(".zip");
 
-    match check_version_with_delay(&module, version_clean, config, checker).await? {
+    match check_version_with_delay(&module, version_clean, config, checker, cache).await? {
         DelayCheckOutcome::Allowed => {
             logger.log(&DelayLogEntry::new(
                 PackageType::GoMod,

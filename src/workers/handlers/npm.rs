@@ -4,7 +4,7 @@ use worker::{Fetch, Headers, Request, Response};
 
 use crate::core::delay_logger::{DelayLogger, PackageType};
 use crate::core::Config;
-use crate::core::{DelayCheckError, DelayChecker, VersionCheckResult};
+use crate::core::{DelayCheckError, DelayChecker, VersionCheckResult, MetadataCache};
 
 fn get_base_url(req: &Request) -> String {
     let host = req
@@ -71,7 +71,16 @@ fn extract_version_from_filename(filename: &str) -> Option<String> {
     }
 }
 
-async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, Response> {
+async fn fetch_package_metadata(package: &str, registry: &str, cache: Option<&MetadataCache>) -> Result<Value, Response> {
+    // 检查缓存
+    if let Some(cache) = cache {
+        if let Ok(true) = cache.is_valid(package, 24) { // 24小时缓存
+            if let Ok(Some(metadata)) = cache.get(package) {
+                return Ok(metadata.metadata);
+            }
+        }
+    }
+    
     let url = format!("{}/{}", registry, package);
 
     let upstream_req = match Request::new(&url, worker::Method::Get) {
@@ -156,6 +165,11 @@ async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, 
         )
         .unwrap_or_else(|_| Response::error("Internal Server Error", 500).unwrap())
     })?;
+    
+    // 存储到缓存
+    if let Some(cache) = cache {
+        let _ = cache.set(package, &metadata);
+    }
 
     Ok(metadata)
 }
@@ -258,6 +272,7 @@ pub async fn handle_npm_metadata(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> worker::Result<Response> {
     let path = req.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -269,7 +284,7 @@ pub async fn handle_npm_metadata(
         }
     };
 
-    let mut metadata = match fetch_package_metadata(package, &config.npm_registry).await {
+    let mut metadata = match fetch_package_metadata(package, &config.npm_registry, cache).await {
         Ok(m) => m,
         Err(resp) => return Ok(resp),
     };
@@ -323,6 +338,7 @@ pub async fn handle_npm_version(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> worker::Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = req.headers().get("CF-Connecting-IP").ok().flatten();
@@ -344,7 +360,7 @@ pub async fn handle_npm_version(
         }
     };
 
-    let metadata = match fetch_package_metadata(package, &config.npm_registry).await {
+    let metadata = match fetch_package_metadata(package, &config.npm_registry, cache).await {
         Ok(m) => m,
         Err(resp) => return Ok(resp),
     };
@@ -459,6 +475,7 @@ pub async fn handle_npm_download(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> worker::Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = req.headers().get("CF-Connecting-IP").ok().flatten();
@@ -507,7 +524,7 @@ pub async fn handle_npm_download(
         }
     };
 
-    let metadata = match fetch_package_metadata(package, &config.npm_registry).await {
+    let metadata = match fetch_package_metadata(package, &config.npm_registry, cache).await {
         Ok(m) => m,
         Err(resp) => return Ok(resp),
     };

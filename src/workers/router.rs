@@ -318,8 +318,8 @@ async fn dispatch(
     }
 
     match parts[0] {
-        "npm" | "dl" => dispatch_npm(req, &parts, config, checker).await,
-        "gomod" => dispatch_gomod(req, &parts, config, checker).await,
+        "npm" | "dl" => dispatch_npm(req, &parts, config, checker, cache).await,
+        "gomod" => dispatch_gomod(req, &parts, config, checker, cache).await,
         "pypi" => dispatch_pypi(req, &parts, config, checker, cache).await,
         _ => None,
     }
@@ -330,19 +330,20 @@ async fn dispatch_npm(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Option<HandlerResult> {
     let req = req.clone().ok()?;
 
     if parts[0] == "npm" && parts.len() == 2 {
-        return Some(super::handlers::npm::handle_npm_metadata(req, config, checker).await);
+        return Some(super::handlers::npm::handle_npm_metadata(req, config, checker, cache).await);
     }
 
     if parts[0] == "npm" && parts.len() == 3 {
-        return Some(super::handlers::npm::handle_npm_version(req, config, checker).await);
+        return Some(super::handlers::npm::handle_npm_version(req, config, checker, cache).await);
     }
 
     if parts[0] == "dl" && parts.len() >= 2 {
-        return Some(super::handlers::npm::handle_npm_download(req, config, checker).await);
+        return Some(super::handlers::npm::handle_npm_download(req, config, checker, cache).await);
     }
 
     None
@@ -353,6 +354,7 @@ async fn dispatch_gomod(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
+    cache: Option<&MetadataCache>,
 ) -> Option<HandlerResult> {
     let req = req.clone().ok()?;
     let last = parts.last()?;
@@ -362,15 +364,15 @@ async fn dispatch_gomod(
     }
 
     if last.ends_with(".info") {
-        return Some(super::handlers::gomod::handle_gomod_version_info(req, config, checker).await);
+        return Some(super::handlers::gomod::handle_gomod_version_info(req, config, checker, cache).await);
     }
 
     if last.ends_with(".mod") {
-        return Some(super::handlers::gomod::handle_gomod_go_mod(req, config, checker).await);
+        return Some(super::handlers::gomod::handle_gomod_go_mod(req, config, checker, cache).await);
     }
 
     if last.ends_with(".zip") {
-        return Some(super::handlers::gomod::handle_gomod_download(req, config, checker).await);
+        return Some(super::handlers::gomod::handle_gomod_download(req, config, checker, cache).await);
     }
 
     None
