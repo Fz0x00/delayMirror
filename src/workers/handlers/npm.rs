@@ -46,8 +46,13 @@ async fn proxy_upstream(url: &str, extra_headers: Option<&Headers>) -> worker::R
         }
     }
 
+    // Add cache headers for better performance
+    headers.set("Cache-Control", "public, max-age=86400")?;
+
     let mut resp = Response::from_bytes(body)?.with_status(status);
     if has_extra {
+        resp = resp.with_headers(headers);
+    } else {
         resp = resp.with_headers(headers);
     }
 
@@ -88,6 +93,9 @@ async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, 
             .unwrap_or_else(|_| Response::error("Bad Gateway", 502).unwrap()));
         }
     };
+
+    // Add cache headers to request
+    upstream_req.headers_mut()?.set("Cache-Control", "max-age=3600")?;
 
     let mut resp = match Fetch::Request(upstream_req).send().await {
         Ok(r) => r,
@@ -228,8 +236,8 @@ fn rewrite_tarball_urls(metadata: &mut Value, base_url: &str, _registry_url: &st
             if let Some(dist) = version_data.get_mut("dist") {
                 if let Some(tarball) = dist.get_mut("tarball") {
                     if tarball.as_str().is_some() {
-                        let new_tarball =
-                            format!("{}/dl/{}@{}", base_url, package_name, version_key);
+                        let new_tarball = 
+                            format!("{}/dl/{package_name}@{version_key}", base_url);
                         *tarball = Value::String(new_tarball);
                     }
                 }
@@ -283,6 +291,7 @@ pub async fn handle_npm_metadata(
                 let body = serde_json::to_string(&metadata)?;
                 let mut headers = Headers::new();
                 headers.set("Content-Type", "application/json")?;
+                headers.set("Cache-Control", "public, max-age=3600")?;
                 headers.set("X-Delay-Warning", "All versions are recent")?;
                 return Ok(Response::from_bytes(body.into_bytes())?
                     .with_status(200)
@@ -314,6 +323,7 @@ pub async fn handle_npm_metadata(
     let body = serde_json::to_string(&metadata)?;
     let mut headers = Headers::new();
     headers.set("Content-Type", "application/json")?;
+    headers.set("Cache-Control", "public, max-age=3600")?;
     Ok(Response::from_bytes(body.into_bytes())?
         .with_status(200)
         .with_headers(headers))
@@ -930,7 +940,8 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap()
-            .starts_with("http://gateway:8787/dl/"));
+            .starts_with("http://gateway:8787/dl/")
+        );
     }
 
     #[test]
