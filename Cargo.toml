@@ -15,16 +15,22 @@ required-features = ["server"]
 
 [features]
 default = []
-workers = ["dep:worker", "dep:console_error_panic_hook", "dep:regex"]
+workers = ["dep:worker", "dep:console_error_panic_hook", "dep:regex", "dep:web-sys", "dep:js-sys"]
 server = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:regex"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+semver = { version = "1", features = ["serde"] }
+
+pep440_rs = "0.6"
+sha2 = "0.10"
 
 worker = { version = "0.5", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", optional = true }
+js-sys = { version = "0.3", optional = true }
 
 axum = { version = "0.6", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -32,6 +38,11 @@ reqwest = { version = "0.11", features = ["json"], optional = true }
 regex = { version = "1", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "core_benchmarks"
+harness = false
 
 [build-dependencies]
 chrono = "0.4"

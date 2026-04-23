@@ -1,16 +1,56 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use worker::*;
 
 use crate::core::{
     Config, DelayAction, DelayChecker, DelayLogEntry, DelayLogger, PackageType, VersionCheckResult,
 };
 
+const INFO_MOD_TIMEOUT_MS: u32 = 5000;
+const LIST_TIMEOUT_MS: u32 = 10000;
+const ZIP_TIMEOUT_MS: u32 = 30000;
+
+const CACHE_TTL_SECS: u64 = 30;
+
+struct CachedInfo {
+    body: String,
+    fetched_at: Instant,
+}
+
+thread_local! {
+    static VERSION_CACHE: RefCell<HashMap<String, CachedInfo>> = RefCell::new(HashMap::new());
+}
+
 fn new_get_request(url: &str) -> Result<Request> {
     let mut req = Request::new(url, Method::Get)?;
     req.headers_mut()?
         .set("User-Agent", "delay-mirror/1.0 (Cloudflare Worker)")?;
     Ok(req)
+}
+
+async fn fetch_upstream_with_timeout(url: &str, timeout_ms: u32) -> Result<worker::Response> {
+    use wasm_bindgen::{prelude::Closure, JsCast};
+
+    let controller = AbortController::default();
+    let signal = controller.signal();
+
+    let req = new_get_request(url)?;
+
+    let global: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let _timeout_id = {
+        let closure = Closure::once(move || {
+            controller.abort();
+        });
+        global.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            timeout_ms as i32,
+        )?
+    };
+
+    Ok(Fetch::Request(req).send_with_signal(&signal).await?)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -21,11 +61,52 @@ struct GoModVersionInfo {
 }
 
 #[derive(Debug)]
-enum DelayCheckOutcome {
-    Allowed,
+enum DelayCheckResult {
+    Allowed { info_body: String },
     Denied { publish_time: DateTime<Utc> },
     NotFound,
     UpstreamError(u16),
+}
+
+#[derive(Clone, Copy)]
+pub enum GomodEndpoint {
+    List,
+    Latest,
+    Info,
+    Mod,
+    Zip,
+}
+
+impl GomodEndpoint {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Latest => "latest",
+            Self::Info => ".info",
+            Self::Mod => ".mod",
+            Self::Zip => ".zip",
+        }
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        match self {
+            Self::List | Self::Mod => "text/plain; charset=utf-8",
+            Self::Latest | Self::Info => "application/json",
+            Self::Zip => "application/octet-stream",
+        }
+    }
+
+    pub fn needs_delay_check(&self) -> bool {
+        !matches!(self, Self::List)
+    }
+
+    pub fn should_stream(&self) -> bool {
+        matches!(self, Self::Zip)
+    }
+
+    pub fn uses_download_registry(&self) -> bool {
+        matches!(self, Self::Zip)
+    }
 }
 
 pub fn escape_module_path(module: &str) -> String {
@@ -66,6 +147,47 @@ fn extract_reject_time(result: &VersionCheckResult) -> Option<&DateTime<Utc>> {
     }
 }
 
+fn extract_pseudo_version_time(version: &str) -> Option<DateTime<Utc>> {
+    let parts: Vec<&str> = version.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let timestamp_str = parts[parts.len() - 2];
+    if timestamp_str.len() != 14 || !timestamp_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let rfc3339 = format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &timestamp_str[0..4],
+        &timestamp_str[4..6],
+        &timestamp_str[6..8],
+        &timestamp_str[8..10],
+        &timestamp_str[10..12],
+        &timestamp_str[12..14]
+    );
+    rfc3339.parse::<DateTime<Utc>>().ok()
+}
+
+async fn smart_check_version(
+    module: &str,
+    version: &str,
+    config: &Config,
+    checker: &DelayChecker,
+) -> Result<DelayCheckResult> {
+    if let Some(pseudo_time) = extract_pseudo_version_time(version) {
+        return Ok(if checker.is_version_allowed(&pseudo_time) {
+            DelayCheckResult::Allowed {
+                info_body: String::new(),
+            }
+        } else {
+            DelayCheckResult::Denied {
+                publish_time: pseudo_time,
+            }
+        });
+    }
+    check_version_with_delay_cached(module, version, config, checker).await
+}
+
 fn build_forbidden_response(
     module: &str,
     version: &str,
@@ -99,7 +221,24 @@ fn build_forbidden_response(
     headers.set("X-Delay-Publish-Time", &reject_time.to_rfc3339())?;
     headers.set("Content-Type", "application/json")?;
 
-    Ok(Response::error(body.to_string(), 403)?.with_headers(headers))
+    Ok(Response::error(body.to_string(), 404)?.with_headers(headers))
+}
+
+fn not_found_json(module: &str, version: &str) -> String {
+    serde_json::json!({
+        "error": "Version not found",
+        "module": module,
+        "version": version
+    })
+    .to_string()
+}
+
+fn upstream_error_json(status: u16) -> String {
+    serde_json::json!({
+        "error": "Upstream registry error",
+        "status": status
+    })
+    .to_string()
 }
 
 fn extract_client_ip(req: &Request) -> Option<String> {
@@ -110,43 +249,61 @@ fn extract_client_ip(req: &Request) -> Option<String> {
         .flatten()
 }
 
-async fn check_version_with_delay(
+async fn get_or_fetch_info(module: &str, version: &str, config: &Config) -> Result<Option<String>> {
+    let cache_key = format!("{}@{}", module, version);
+
+    let cached_body = VERSION_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache.get(&cache_key).and_then(|entry| {
+            if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
+                Some(entry.body.clone())
+            } else {
+                None
+            }
+        })
+    });
+
+    if let Some(body) = cached_body {
+        return Ok(Some(body));
+    }
+
+    let escaped_module = escape_module_path(module);
+    let url = config.gomod_meta_url(&escaped_module, &format!("/@v/{}.info", version));
+
+    let req = new_get_request(&url)?;
+    let mut resp = Fetch::Request(req).send().await?;
+
+    if resp.status_code() == 404 {
+        return Ok(None);
+    }
+    if resp.status_code() < 200 || resp.status_code() >= 300 {
+        return Err(format!("Upstream error: {}", resp.status_code()).into());
+    }
+
+    let body = resp.text().await?;
+
+    VERSION_CACHE.with(|cache| {
+        cache.borrow_mut().insert(
+            cache_key,
+            CachedInfo {
+                body: body.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+    });
+
+    Ok(Some(body))
+}
+
+async fn check_version_with_delay_cached(
     module: &str,
     version: &str,
     config: &Config,
     delay_checker: &DelayChecker,
-) -> Result<DelayCheckOutcome> {
-    let escaped_module = escape_module_path(module);
-    let url = format!(
-        "{}/{}/@v/{}.info",
-        config.gomod_registry.trim_end_matches('/'),
-        escaped_module,
-        version
-    );
-
-    let req = new_get_request(&url)?;
-    let mut resp = match Fetch::Request(req).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            console_error!("Failed to fetch version info from upstream: {}", e);
-            return Err("Failed to fetch version info from upstream registry".into());
-        }
-    };
-
-    if resp.status_code() == 404 {
-        return Ok(DelayCheckOutcome::NotFound);
-    }
-
-    if resp.status_code() < 200 || resp.status_code() >= 300 {
-        return Ok(DelayCheckOutcome::UpstreamError(resp.status_code()));
-    }
-
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => {
-            console_error!("Failed to read response body: {}", e);
-            return Err("Failed to read upstream response body".into());
-        }
+) -> Result<DelayCheckResult> {
+    let body = match get_or_fetch_info(module, version, config).await? {
+        Some(b) => b,
+        None => return Ok(DelayCheckResult::NotFound),
     };
 
     let version_info: GoModVersionInfo = match serde_json::from_str(&body) {
@@ -160,100 +317,189 @@ async fn check_version_with_delay(
     let publish_time = parse_version_time(&version_info.Time)?;
 
     if delay_checker.is_version_allowed(&publish_time) {
-        Ok(DelayCheckOutcome::Allowed)
+        Ok(DelayCheckResult::Allowed { info_body: body })
     } else {
-        Ok(DelayCheckOutcome::Denied { publish_time })
+        Ok(DelayCheckResult::Denied { publish_time })
     }
 }
 
-pub async fn handle_gomod_version_list(req: Request, config: &Config) -> Result<Response> {
-    let path = req.path();
+fn parse_gomod_path(path: &str, endpoint: GomodEndpoint) -> Result<(String, String)> {
     let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if path_parts.len() < 3 || path_parts[0] != "gomod" || path_parts.last() != Some(&"list") {
-        return Response::error("Invalid request path", 400);
+    if path_parts.len() < 5 {
+        return Err("Invalid Go module path format".into());
     }
 
     let module = path_parts[1..path_parts.len() - 2].join("/");
+    let last_part = path_parts.last().unwrap_or(&"");
 
-    let escaped_module = escape_module_path(&module);
-    let url = format!(
-        "{}/{}/@v/list",
-        config.gomod_registry.trim_end_matches('/'),
-        escaped_module
-    );
-
-    let upstream_req = new_get_request(&url)?;
-    let mut resp = match Fetch::Request(upstream_req).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            console_error!("Failed to connect to Go modules registry: {}", e);
-            return Err("Failed to connect to upstream Go modules registry".into());
-        }
+    let version = match endpoint {
+        GomodEndpoint::List | GomodEndpoint::Latest => endpoint.extension().to_string(),
+        _ => last_part
+            .trim_end_matches(".info")
+            .trim_end_matches(".mod")
+            .trim_end_matches(".zip")
+            .to_string(),
     };
 
-    if resp.status_code() == 404 {
-        return Response::error(
-            serde_json::json!({
-                "error": "Module not found",
-                "module": module
-            })
-            .to_string(),
-            404,
-        );
-    }
-
-    if resp.status_code() < 200 || resp.status_code() >= 300 {
-        return Response::error(
-            serde_json::json!({
-                "error": "Upstream registry error",
-                "status": resp.status_code()
-            })
-            .to_string(),
-            502,
-        );
-    }
-
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => {
-            console_error!("Failed to read response body: {}", e);
-            return Err("Failed to read upstream response body".into());
-        }
-    };
-
-    let mut headers = Headers::new();
-    headers.set("X-Delay-Mode", "whitelist-fallback")?;
-    headers.set(
-        "X-Delay-Warning",
-        "Go Modules list endpoint does not provide version timestamps. Use individual version endpoints for delay checking.",
-    )?;
-    headers.set("Content-Type", "text/plain; charset=utf-8")?;
-
-    Ok(Response::ok(body)?.with_headers(headers))
+    Ok((module, version))
 }
 
-pub async fn handle_gomod_version_info(
+fn build_upstream_url(
+    module: &str,
+    version: &str,
+    config: &Config,
+    endpoint: GomodEndpoint,
+) -> String {
+    let escaped_module = escape_module_path(module);
+    let path_suffix = format!("/@v/{}{}", version, endpoint.extension());
+
+    if endpoint.uses_download_registry() {
+        config.gomod_download_url(&escaped_module, &path_suffix)
+    } else {
+        config.gomod_meta_url(&escaped_module, &path_suffix)
+    }
+}
+
+async fn fetch_and_respond(
+    url: &str,
+    endpoint: GomodEndpoint,
+    cached_body: Option<String>,
+) -> Result<Response> {
+    let mut headers = Headers::new();
+    headers.set("Content-Type", endpoint.content_type())?;
+
+    if let Some(body) = cached_body {
+        return Ok(Response::ok(body)?.with_headers(headers));
+    }
+
+    let timeout_ms = match endpoint {
+        GomodEndpoint::Zip => ZIP_TIMEOUT_MS,
+        GomodEndpoint::List => LIST_TIMEOUT_MS,
+        _ => INFO_MOD_TIMEOUT_MS,
+    };
+
+    let stream = endpoint.should_stream();
+    let mut resp = fetch_upstream_with_timeout(url, timeout_ms).await?;
+
+    if stream {
+        let mut headers = Headers::new();
+        headers.set("Content-Type", endpoint.content_type())?;
+        Ok(resp.with_headers(headers))
+    } else {
+        let body = resp.text().await?;
+        Ok(Response::ok(body)?.with_headers(headers))
+    }
+}
+
+async fn try_fetch_zip(url: &str) -> Result<worker::Response> {
+    fetch_upstream_with_timeout(url, ZIP_TIMEOUT_MS).await
+}
+
+async fn fetch_zip_with_fallback(module: &str, version: &str, config: &Config) -> Result<Response> {
+    let escaped_module = escape_module_path(module);
+    let path_suffix = format!("/@v/{}.zip", version);
+
+    let primary_url = config.gomod_download_url(&escaped_module, &path_suffix);
+    let fallback_url = config.gomod_meta_url(&escaped_module, &path_suffix);
+
+    match try_fetch_zip(&primary_url).await {
+        Ok(resp) if resp.status_code() == 200 => {
+            let mut headers = Headers::new();
+            headers.set("Content-Type", "application/octet-stream")?;
+            Ok(resp.with_headers(headers))
+        }
+        _ => {
+            console_error!("Primary download source failed, trying fallback");
+            match try_fetch_zip(&fallback_url).await {
+                Ok(resp) if resp.status_code() == 200 => {
+                    let mut headers = Headers::new();
+                    headers.set("Content-Type", "application/octet-stream")?;
+                    Ok(resp.with_headers(headers))
+                }
+                Ok(resp) => {
+                    Response::error(upstream_error_json(resp.status_code()), resp.status_code())
+                }
+                Err(e) => Response::error(format!("{{\"error\":\"{}\"}}", e), 502),
+            }
+        }
+    }
+}
+
+async fn handle_list_endpoint(
+    module: &str,
+    config: &Config,
+    checker: &DelayChecker,
+) -> Result<Response> {
+    let escaped_module = escape_module_path(module);
+    let url = config.gomod_meta_url(&escaped_module, "/@v/list");
+
+    let mut resp = fetch_upstream_with_timeout(&url, LIST_TIMEOUT_MS).await?;
+
+    let status_code = resp.status_code();
+    if status_code == 404 {
+        return Response::error(not_found_json(module, "list"), 404);
+    }
+    if status_code < 200 || status_code >= 300 {
+        return Response::error(upstream_error_json(status_code), 502);
+    }
+
+    let raw_body = resp.text().await?;
+
+    let versions: Vec<&str> = raw_body.lines().collect();
+    let mut allowed_versions = Vec::new();
+    let logger = DelayLogger::new();
+
+    for version in versions {
+        match smart_check_version(module, version, config, checker).await {
+            Ok(DelayCheckResult::Allowed { .. }) => {
+                allowed_versions.push(version.to_string());
+            }
+            Ok(DelayCheckResult::Denied { publish_time: _ }) => {
+                logger.log_blocked(
+                    PackageType::GoMod,
+                    module,
+                    version,
+                    &format!(
+                        "Version was published within the last {} day(s)",
+                        checker.delay_days()
+                    ),
+                    None,
+                );
+            }
+            _ => {
+                allowed_versions.push(version.to_string());
+            }
+        }
+    }
+
+    let filtered_body = allowed_versions.join("\n");
+
+    let mut headers = Headers::new();
+    headers.set("Content-Type", "text/plain; charset=utf-8")?;
+    headers.set(
+        "X-Delay-Warning",
+        "Go Modules list endpoint has been filtered by delay policy. Some recent versions may be hidden.",
+    )?;
+    Ok(Response::ok(filtered_body)?.with_headers(headers))
+}
+
+pub async fn handle_gomod_request(
     req: Request,
     config: &Config,
     checker: &DelayChecker,
+    endpoint: GomodEndpoint,
 ) -> Result<Response> {
     let logger = DelayLogger::new();
     let client_ip = extract_client_ip(&req);
 
-    let path = req.path();
-    let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (module, version) = parse_gomod_path(&req.path(), endpoint)?;
 
-    if path_parts.len() < 5 || path_parts[0] != "gomod" {
-        return Response::error("Invalid request path", 400);
+    if matches!(endpoint, GomodEndpoint::List) {
+        return handle_list_endpoint(&module, config, checker).await;
     }
 
-    let module = path_parts[1..path_parts.len() - 3].join("/");
-    let version_with_ext = path_parts[path_parts.len() - 2];
-    let version = version_with_ext.trim_end_matches(".info");
-
-    match check_version_with_delay(&module, version, config, checker).await? {
-        DelayCheckOutcome::Allowed => {
+    match smart_check_version(&module, &version, config, checker).await? {
+        DelayCheckResult::Allowed { info_body } => {
             logger.log(&DelayLogEntry::new(
                 PackageType::GoMod,
                 module.clone(),
@@ -261,251 +507,40 @@ pub async fn handle_gomod_version_info(
                 None,
                 DelayAction::Allowed,
                 "Version passed delay check".to_string(),
-                client_ip.clone(),
+                client_ip,
             ));
 
-            let escaped_module = escape_module_path(&module);
-            let url = format!(
-                "{}/{}/@v/{}.info",
-                config.gomod_registry.trim_end_matches('/'),
-                escaped_module,
-                version
-            );
-
-            let upstream_req = new_get_request(&url)?;
-            let mut resp = match Fetch::Request(upstream_req).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    console_error!("Failed to fetch version info: {}", e);
-                    return Err("Failed to fetch version info from upstream".into());
-                }
-            };
-
-            let body = match resp.text().await {
-                Ok(b) => b,
-                Err(e) => {
-                    console_error!("Failed to read response body: {}", e);
-                    return Err("Failed to read upstream response body".into());
-                }
-            };
-
-            let mut headers = Headers::new();
-            headers.set("Content-Type", "application/json")?;
-            Ok(Response::ok(body)?.with_headers(headers))
-        }
-        DelayCheckOutcome::Denied { ref publish_time } => build_forbidden_response(
-            &module,
-            version,
-            publish_time,
-            checker,
-            &logger,
-            client_ip.as_deref(),
-        ),
-        DelayCheckOutcome::NotFound => Response::error(
-            serde_json::json!({
-                "error": "Version not found",
-                "module": module,
-                "version": version
-            })
-            .to_string(),
-            404,
-        ),
-        DelayCheckOutcome::UpstreamError(status) => Response::error(
-            serde_json::json!({
-                "error": "Upstream registry error",
-                "status": status
-            })
-            .to_string(),
-            502,
-        ),
-    }
-}
-
-pub async fn handle_gomod_go_mod(
-    req: Request,
-    config: &Config,
-    checker: &DelayChecker,
-) -> Result<Response> {
-    let logger = DelayLogger::new();
-    let client_ip = extract_client_ip(&req);
-
-    let path = req.path();
-    let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if path_parts.len() < 5 || path_parts[0] != "gomod" {
-        return Response::error("Invalid request path", 400);
-    }
-
-    let module = path_parts[1..path_parts.len() - 3].join("/");
-    let version_with_ext = path_parts[path_parts.len() - 2];
-    let version = version_with_ext.trim_end_matches(".mod");
-
-    match check_version_with_delay(&module, version, config, checker).await? {
-        DelayCheckOutcome::Allowed => {
-            logger.log(&DelayLogEntry::new(
-                PackageType::GoMod,
-                module.clone(),
-                version.to_string(),
-                None,
-                DelayAction::Allowed,
-                "go.mod access passed delay check".to_string(),
-                client_ip.clone(),
-            ));
-
-            let escaped_module = escape_module_path(&module);
-            let url = format!(
-                "{}/{}/@v/{}.mod",
-                config.gomod_registry.trim_end_matches('/'),
-                escaped_module,
-                version
-            );
-
-            let upstream_req = new_get_request(&url)?;
-            let mut resp = match Fetch::Request(upstream_req).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    console_error!("Failed to fetch go.mod: {}", e);
-                    return Err("Failed to fetch go.mod from upstream".into());
-                }
-            };
-
-            if resp.status_code() == 404 {
-                return Response::error(
-                    serde_json::json!({
-                        "error": "Module version not found",
-                        "module": module,
-                        "version": version
-                    })
-                    .to_string(),
-                    404,
-                );
+            if matches!(endpoint, GomodEndpoint::Zip) {
+                return fetch_zip_with_fallback(&module, &version, config).await;
             }
 
-            if resp.status_code() < 200 || resp.status_code() >= 300 {
-                return Response::error(
-                    serde_json::json!({
-                        "error": "Upstream registry error",
-                        "status": resp.status_code()
-                    })
-                    .to_string(),
-                    502,
-                );
-            }
-
-            let body = match resp.text().await {
-                Ok(b) => b,
-                Err(e) => {
-                    console_error!("Failed to read response body: {}", e);
-                    return Err("Failed to read upstream response body".into());
-                }
+            let upstream_url = build_upstream_url(&module, &version, config, endpoint);
+            let cached = if info_body.is_empty() {
+                None
+            } else {
+                Some(info_body)
             };
-
-            let mut headers = Headers::new();
-            headers.set("Content-Type", "text/plain; charset=utf-8")?;
-            Ok(Response::ok(body)?.with_headers(headers))
+            fetch_and_respond(&upstream_url, endpoint, cached).await
         }
-        DelayCheckOutcome::Denied { ref publish_time } => build_forbidden_response(
+        DelayCheckResult::Denied { publish_time } => build_forbidden_response(
             &module,
-            version,
-            publish_time,
+            &version,
+            &publish_time,
             checker,
             &logger,
             client_ip.as_deref(),
         ),
-        DelayCheckOutcome::NotFound => Response::error(
-            serde_json::json!({
-                "error": "Module version not found",
-                "module": module,
-                "version": version
-            })
-            .to_string(),
-            404,
-        ),
-        DelayCheckOutcome::UpstreamError(status) => Response::error(
-            serde_json::json!({
-                "error": "Upstream registry error",
-                "status": status
-            })
-            .to_string(),
-            502,
-        ),
-    }
-}
-
-pub async fn handle_gomod_download(
-    req: Request,
-    config: &Config,
-    checker: &DelayChecker,
-) -> Result<Response> {
-    let logger = DelayLogger::new();
-    let client_ip = extract_client_ip(&req);
-
-    let path = req.path();
-    let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if path_parts.len() < 5 || path_parts[0] != "gomod" {
-        return Response::error("Invalid request path", 400);
-    }
-
-    let module = path_parts[1..path_parts.len() - 3].join("/");
-    let version_raw = path_parts[path_parts.len() - 2];
-    let version_clean = version_raw.trim_end_matches(".zip");
-
-    match check_version_with_delay(&module, version_clean, config, checker).await? {
-        DelayCheckOutcome::Allowed => {
-            logger.log(&DelayLogEntry::new(
-                PackageType::GoMod,
-                module.clone(),
-                version_clean.to_string(),
-                None,
-                DelayAction::Allowed,
-                "Download passed delay check".to_string(),
-                client_ip.clone(),
-            ));
-
-            let escaped_module = escape_module_path(&module);
-            let upstream_url = format!(
-                "{}/{}/@v/{}.zip",
-                config.gomod_download_registry.trim_end_matches('/'),
-                escaped_module,
-                version_clean
-            );
-
-            let upstream_req = new_get_request(&upstream_url)?;
-            Fetch::Request(upstream_req).send().await
+        DelayCheckResult::NotFound => Response::error(not_found_json(&module, &version), 404),
+        DelayCheckResult::UpstreamError(status) => {
+            Response::error(upstream_error_json(status), status)
         }
-        DelayCheckOutcome::Denied { ref publish_time } => build_forbidden_response(
-            &module,
-            version_clean,
-            publish_time,
-            checker,
-            &logger,
-            client_ip.as_deref(),
-        ),
-        DelayCheckOutcome::NotFound => Response::error(
-            serde_json::json!({
-                "error": "Version not found",
-                "module": module,
-                "version": version_clean
-            })
-            .to_string(),
-            404,
-        ),
-        DelayCheckOutcome::UpstreamError(status) => Response::error(
-            serde_json::json!({
-                "error": "Upstream registry error",
-                "status": status
-            })
-            .to_string(),
-            502,
-        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
+    use chrono::{Datelike, Timelike};
 
     #[test]
     fn test_parse_version_time_valid() {
@@ -746,5 +781,156 @@ mod tests {
         let version = "v1.0.0.mod";
         let cleaned = version.trim_end_matches(".mod");
         assert_eq!(cleaned, "v1.0.0");
+    }
+
+    #[test]
+    fn test_extract_pseudo_version_time_valid() {
+        let cases = vec![
+            ("v0.0.0-20240101120000-abc123def456", 2024, 1, 1, 12, 0, 0),
+            ("v0.0.0-20230102150405-a1b2c3d4e5f6", 2023, 1, 2, 15, 4, 5),
+            ("v1.2.3-0.20240101120000-abc123def456", 2024, 1, 1, 12, 0, 0),
+            (
+                "v2.0.0-20251231235959-abcdef123456",
+                2025,
+                12,
+                31,
+                23,
+                59,
+                59,
+            ),
+        ];
+        for (version, y, mo, d, h, mi, s) in cases {
+            let dt = extract_pseudo_version_time(version)
+                .unwrap_or_else(|| panic!("Should parse: {}", version));
+            assert_eq!(dt.year(), y, "year mismatch for {}", version);
+            assert_eq!(dt.month() as i32, mo, "month mismatch for {}", version);
+            assert_eq!(dt.day(), d, "day mismatch for {}", version);
+            assert_eq!(dt.hour(), h, "hour mismatch for {}", version);
+            assert_eq!(dt.minute(), mi, "minute mismatch for {}", version);
+            assert_eq!(dt.second(), s, "second mismatch for {}", version);
+        }
+    }
+
+    #[test]
+    fn test_extract_pseudo_version_time_invalid_formats() {
+        let invalid = vec!["v1.0.0", "v1.0.0-beta", "v1.0.0-beta.1", "v1.0.0+build"];
+        for version in invalid {
+            assert!(
+                extract_pseudo_version_time(version).is_none(),
+                "Should return None for: {}",
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_pseudo_version_time_edge_cases() {
+        assert!(
+            extract_pseudo_version_time("v0.0.0-20240101-abc123").is_none(),
+            "Short timestamp (8 digits) should be None"
+        );
+        assert!(
+            extract_pseudo_version_time("v0.0.0-2024010112000-abc123").is_none(),
+            "13-digit timestamp should be None"
+        );
+        assert!(
+            extract_pseudo_version_time("v0.0.0-202401011200000-abc123").is_none(),
+            "15-digit timestamp should be None"
+        );
+        assert!(
+            extract_pseudo_version_time("v0.0.0-2024a101120000-abc123").is_none(),
+            "Timestamp with letter should be None"
+        );
+        assert!(
+            extract_pseudo_version_time("v0.0.0-20240101120000").is_none(),
+            "Only 2 parts after split should be None"
+        );
+    }
+
+    #[test]
+    fn test_gomod_endpoint_extension() {
+        assert_eq!(GomodEndpoint::List.extension(), "list");
+        assert_eq!(GomodEndpoint::Latest.extension(), "latest");
+        assert_eq!(GomodEndpoint::Info.extension(), ".info");
+        assert_eq!(GomodEndpoint::Mod.extension(), ".mod");
+        assert_eq!(GomodEndpoint::Zip.extension(), ".zip");
+    }
+
+    #[test]
+    fn test_gomod_endpoint_content_type() {
+        assert_eq!(
+            GomodEndpoint::List.content_type(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(GomodEndpoint::Latest.content_type(), "application/json");
+        assert_eq!(GomodEndpoint::Info.content_type(), "application/json");
+        assert_eq!(
+            GomodEndpoint::Mod.content_type(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(GomodEndpoint::Zip.content_type(), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_gomod_endpoint_needs_delay_check() {
+        assert!(!GomodEndpoint::List.needs_delay_check());
+        assert!(GomodEndpoint::Latest.needs_delay_check());
+        assert!(GomodEndpoint::Info.needs_delay_check());
+        assert!(GomodEndpoint::Mod.needs_delay_check());
+        assert!(GomodEndpoint::Zip.needs_delay_check());
+    }
+
+    #[test]
+    fn test_gomod_endpoint_should_stream() {
+        assert!(!GomodEndpoint::List.should_stream());
+        assert!(!GomodEndpoint::Latest.should_stream());
+        assert!(!GomodEndpoint::Info.should_stream());
+        assert!(!GomodEndpoint::Mod.should_stream());
+        assert!(GomodEndpoint::Zip.should_stream());
+    }
+
+    #[test]
+    fn test_gomod_endpoint_uses_download_registry() {
+        assert!(!GomodEndpoint::List.uses_download_registry());
+        assert!(!GomodEndpoint::Latest.uses_download_registry());
+        assert!(!GomodEndpoint::Info.uses_download_registry());
+        assert!(!GomodEndpoint::Mod.uses_download_registry());
+        assert!(GomodEndpoint::Zip.uses_download_registry());
+    }
+
+    #[test]
+    fn test_escape_module_path_preserves_digits() {
+        assert_eq!(
+            escape_module_path("github.com/v2ray/v2ray-core"),
+            "github.com/v2ray/v2ray-core"
+        );
+    }
+
+    #[test]
+    fn test_escape_module_path_leading_uppercase() {
+        assert_eq!(escape_module_path("A"), "!a");
+        assert_eq!(escape_module_path("AB"), "!a!b");
+    }
+
+    #[test]
+    fn test_escape_module_path_trailing_uppercase() {
+        assert_eq!(escape_module_path("testA"), "test!a");
+    }
+
+    #[test]
+    fn test_not_found_json_format() {
+        let json_str = not_found_json("github.com/foo/bar", "v1.0.0");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["error"], "Version not found");
+        assert_eq!(parsed["module"], "github.com/foo/bar");
+        assert_eq!(parsed["version"], "v1.0.0");
+    }
+
+    #[test]
+    fn test_upstream_error_json_format() {
+        let json_str = upstream_error_json(502);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["error"], "Upstream registry error");
+        assert_eq!(parsed["status"], 502);
     }
 }

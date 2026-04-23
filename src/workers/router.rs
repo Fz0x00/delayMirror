@@ -4,6 +4,8 @@ use worker::{Headers, Method, Request, Response};
 use crate::core::delay_logger::DelayLogger;
 use crate::core::Config;
 use crate::core::DelayChecker;
+use crate::workers::handlers::gomod::GomodEndpoint;
+use crate::workers::handlers::pypi::RequestContext;
 
 type HandlerResult = worker::Result<Response>;
 
@@ -66,9 +68,9 @@ fn api_index() -> HandlerResult {
                     "download": { "method": "GET", "path": "/gomod/{module}/@v/{version}.zip", "description": "Download module zip" }
                 },
                 "pypi": {
-                    "simple_index": { "method": "GET", "path": "/pypi/simple/", "description": "PyPI simple index" },
-                    "package_list": { "method": "GET", "path": "/pypi/simple/{package}/", "description": "List package files" },
-                    "download": { "method": "GET", "path": "/pypi/packages/{filename}", "description": "Download package file" }
+                    "simple_index": { "method": "GET", "path": "/pypi/simple/ or /simple/", "description": "PyPI simple index" },
+                    "package_list": { "method": "GET", "path": "/pypi/simple/{package}/ or /simple/{package}/", "description": "List package files" },
+                    "download": { "method": "GET", "path": "/pypi/packages/{file} or /packages/{file}", "description": "Download package file" }
                 }
             }
         }),
@@ -268,7 +270,8 @@ pub async fn route_request(req: Request, config: &Config, checker: &DelayChecker
         return make_json_response(200, results);
     }
 
-    let result = dispatch(&req, path, config, checker).await;
+    let mut ctx = RequestContext::new();
+    let result = dispatch(&req, path, config, checker, &mut ctx).await;
     match result {
         Some(resp) => add_cors_headers(resp),
         None => {
@@ -305,6 +308,7 @@ async fn dispatch(
     path: &str,
     config: &Config,
     checker: &DelayChecker,
+    ctx: &mut RequestContext,
 ) -> Option<HandlerResult> {
     let parts: Vec<&str> = path.split('/').collect();
 
@@ -315,8 +319,15 @@ async fn dispatch(
     match parts[0] {
         "npm" | "dl" => dispatch_npm(req, &parts, config, checker).await,
         "gomod" => dispatch_gomod(req, &parts, config, checker).await,
-        "pypi" => dispatch_pypi(req, &parts, config, checker).await,
-        _ => None,
+        "pypi" => dispatch_pypi(req, &parts, config, checker, ctx).await,
+        _ => {
+            let compat = dispatch_npm_compat(req, path, config, checker).await;
+            if compat.is_some() {
+                compat
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -343,6 +354,44 @@ async fn dispatch_npm(
     None
 }
 
+fn is_npm_system_path(part: &str) -> bool {
+    matches!(
+        part,
+        "npm" | "dl" | "gomod" | "pypi" | "health" | "debug" | "-" | "_"
+    )
+}
+
+async fn dispatch_npm_compat(
+    req: &Request,
+    path: &str,
+    config: &Config,
+    checker: &DelayChecker,
+) -> Option<HandlerResult> {
+    let req = req.clone().ok()?;
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let first = parts[0];
+
+    if is_npm_system_path(first) {
+        return None;
+    }
+
+    let last = match parts.last() {
+        Some(&l) => l,
+        None => return None,
+    };
+
+    if last.ends_with(".tgz") || (parts.len() >= 3 && parts[parts.len() - 2] == "-") {
+        return Some(super::handlers::npm::handle_npm_tarball_download(req, config, checker).await);
+    }
+
+    Some(super::handlers::npm::handle_npm_metadata_compat(req, config, checker).await)
+}
+
 async fn dispatch_gomod(
     req: &Request,
     parts: &[&str],
@@ -352,23 +401,25 @@ async fn dispatch_gomod(
     let req = req.clone().ok()?;
     let last = parts.last()?;
 
-    if *last == "list" {
-        return Some(super::handlers::gomod::handle_gomod_version_list(req, config).await);
-    }
+    let endpoint = if *last == "list" {
+        Some(GomodEndpoint::List)
+    } else if *last == "latest" {
+        Some(GomodEndpoint::Latest)
+    } else if last.ends_with(".info") {
+        Some(GomodEndpoint::Info)
+    } else if last.ends_with(".mod") {
+        Some(GomodEndpoint::Mod)
+    } else if last.ends_with(".zip") {
+        Some(GomodEndpoint::Zip)
+    } else {
+        None
+    }?;
 
-    if last.ends_with(".info") {
-        return Some(super::handlers::gomod::handle_gomod_version_info(req, config, checker).await);
-    }
-
-    if last.ends_with(".mod") {
-        return Some(super::handlers::gomod::handle_gomod_go_mod(req, config, checker).await);
-    }
-
-    if last.ends_with(".zip") {
-        return Some(super::handlers::gomod::handle_gomod_download(req, config, checker).await);
-    }
-
-    None
+    Some(
+        super::handlers::gomod::handle_gomod_request(req, config, checker, endpoint)
+            .await
+            .into(),
+    )
 }
 
 async fn dispatch_pypi(
@@ -376,28 +427,61 @@ async fn dispatch_pypi(
     parts: &[&str],
     config: &Config,
     checker: &DelayChecker,
+    ctx: &mut RequestContext,
 ) -> Option<HandlerResult> {
-    if parts.len() == 1 || (parts.len() == 2 && parts[1] == "simple") {
-        return Some(super::handlers::pypi::handle_pypi_simple_index(config).await);
-    }
+    match parts[0] {
+        "pypi" => {
+            if parts.len() == 1 || (parts.len() == 2 && parts[1] == "simple") {
+                return Some(super::handlers::pypi::handle_pypi_simple_index(config).await);
+            }
 
-    if parts.len() >= 3 && parts[1] == "simple" {
-        let package = parts[2];
-        let req = req.clone().ok()?;
-        return Some(
-            super::handlers::pypi::handle_pypi_package_list(req, config, checker, package).await,
-        );
-    }
+            if parts.len() >= 3 && parts[1] == "simple" {
+                let package = parts[2];
+                let req = req.clone().ok()?;
+                return Some(
+                    super::handlers::pypi::handle_pypi_package_list(
+                        req, config, checker, ctx, package,
+                    )
+                    .await,
+                );
+            }
 
-    if parts.len() >= 3 && parts[1] == "packages" {
-        let filename = parts.last()?.to_string();
-        let req = req.clone().ok()?;
-        let logger = DelayLogger::new();
-        return Some(
-            super::handlers::pypi::handle_pypi_download(req, config, checker, &logger, &filename)
+            if parts.len() >= 3 && parts[1] == "packages" {
+                let filename = parts.last()?.to_string();
+                let req = req.clone().ok()?;
+                let logger = DelayLogger::new();
+                return Some(
+                    super::handlers::pypi::handle_pypi_download(
+                        req, config, checker, &logger, ctx, &filename,
+                    )
+                    .await,
+                );
+            }
+
+            None
+        }
+        "simple" => {
+            if parts.len() == 1 {
+                return Some(super::handlers::pypi::handle_pypi_simple_index(config).await);
+            }
+            let package = parts[1];
+            let req = req.clone().ok()?;
+            Some(
+                super::handlers::pypi::handle_pypi_package_list(req, config, checker, ctx, package)
+                    .await,
+            )
+        }
+        "packages" => {
+            let filename = parts.get(1)?.to_string();
+            let req = req.clone().ok()?;
+            let logger = DelayLogger::new();
+            Some(
+                super::handlers::pypi::handle_pypi_download(
+                    req, config, checker, &logger, ctx, &filename,
+                )
                 .await,
-        );
+            )
+        }
+        _ => None,
     }
-
-    None
 }

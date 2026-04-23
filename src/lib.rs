@@ -9,6 +9,6 @@ pub mod pypi_handler;
 
 pub use core::{
     Config, DelayAction, DelayCheckError, DelayChecker, DelayLogEntry, DelayLogger, PackageType,
-    VersionCheckResult,
+    VersionCheckResult, compare_versions, parse_datetime_flexible,
 };
 pub use platform::{HttpError, HttpRequest, HttpResponse};

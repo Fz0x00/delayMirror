@@ -1,4 +1,5 @@
 use regex::Regex;
+use semver::Version;
 use serde_json::{json, Value};
 use worker::{Fetch, Headers, Request, Response};
 
@@ -25,7 +26,7 @@ async fn proxy_upstream(url: &str, extra_headers: Option<&Headers>) -> worker::R
         .headers_mut()?
         .set("Accept", "application/octet-stream, */*")?;
 
-    let mut upstream_resp = match Fetch::Request(upstream_req).send().await {
+    let upstream_resp = match Fetch::Request(upstream_req).send().await {
         Ok(r) => r,
         Err(e) => {
             return Response::error(format!("Upstream fetch failed: {}", e), 502);
@@ -33,22 +34,13 @@ async fn proxy_upstream(url: &str, extra_headers: Option<&Headers>) -> worker::R
     };
 
     let status = upstream_resp.status_code();
-    let body = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| worker::Error::RustError(e.to_string()))?;
-    let mut headers = Headers::new();
-    let has_extra = extra_headers.is_some();
+
+    let mut resp = Response::from_body(upstream_resp.body().clone())?.with_status(status);
 
     if let Some(extra) = extra_headers {
         for (name, value) in extra.entries() {
-            headers.set(&name, &value).ok();
+            resp.headers_mut().set(&name, &value).ok();
         }
-    }
-
-    let mut resp = Response::from_bytes(body)?.with_status(status);
-    if has_extra {
-        resp = resp.with_headers(headers);
     }
 
     Ok(resp)
@@ -74,7 +66,7 @@ fn extract_version_from_filename(filename: &str) -> Option<String> {
 async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, Response> {
     let url = format!("{}/{}", registry, package);
 
-    let upstream_req = match Request::new(&url, worker::Method::Get) {
+    let mut upstream_req = match Request::new(&url, worker::Method::Get) {
         Ok(r) => r,
         Err(e) => {
             return Err(Response::error(
@@ -88,6 +80,13 @@ async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, 
             .unwrap_or_else(|_| Response::error("Bad Gateway", 502).unwrap()));
         }
     };
+
+    if let Ok(headers) = upstream_req.headers_mut() {
+        let _ = headers.set(
+            "Accept",
+            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
+        );
+    }
 
     let mut resp = match Fetch::Request(upstream_req).send().await {
         Ok(r) => r,
@@ -160,6 +159,14 @@ async fn fetch_package_metadata(package: &str, registry: &str) -> Result<Value, 
     Ok(metadata)
 }
 
+fn find_latest_version(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .filter_map(|v| Version::parse(v).ok())
+        .max()
+        .map(|v| v.to_string())
+}
+
 fn filter_versions_by_delay(
     metadata: &mut Value,
     checker: &DelayChecker,
@@ -197,12 +204,8 @@ fn filter_versions_by_delay(
             .get_mut("dist-tags")
             .and_then(|t| t.as_object_mut())
         {
-            if let Some(latest_eligible) = eligible_versions.iter().max_by(|a, b| {
-                let a_parts: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-                let b_parts: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-                a_parts.cmp(&b_parts)
-            }) {
-                dist_tags.insert("latest".to_string(), Value::String(latest_eligible.clone()));
+            if let Some(latest_eligible) = find_latest_version(&eligible_versions) {
+                dist_tags.insert("latest".to_string(), Value::String(latest_eligible));
             }
         }
 
@@ -263,13 +266,22 @@ pub async fn handle_npm_metadata(
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     let package = match parts.get(1) {
-        Some(&p) if !p.is_empty() => p,
+        Some(&p) if !p.is_empty() => p.to_string(),
         _ => {
             return make_error_response(&json!({ "error": "Package name is required" }), 400);
         }
     };
 
-    let mut metadata = match fetch_package_metadata(package, &config.npm_registry).await {
+    handle_npm_metadata_internal(req, package, config, checker).await
+}
+
+async fn handle_npm_metadata_internal(
+    req: Request,
+    package: String,
+    config: &Config,
+    checker: &DelayChecker,
+) -> worker::Result<Response> {
+    let mut metadata = match fetch_package_metadata(&package, &config.npm_registry).await {
         Ok(m) => m,
         Err(resp) => return Ok(resp),
     };
@@ -631,6 +643,188 @@ pub async fn handle_npm_download(
     }
 }
 
+pub async fn handle_npm_metadata_compat(
+    req: Request,
+    config: &Config,
+    checker: &DelayChecker,
+) -> worker::Result<Response> {
+    let path = req.path();
+    let path_trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    let package = path_trimmed.to_string();
+
+    if package.is_empty() || package.contains('/') {
+        return make_error_response(
+            &json!({ "error": "Invalid package name", "path": path }),
+            400,
+        );
+    }
+
+    handle_npm_metadata_internal(req, package, config, checker).await
+}
+
+pub async fn handle_npm_tarball_download(
+    req: Request,
+    config: &Config,
+    checker: &DelayChecker,
+) -> worker::Result<Response> {
+    let logger = DelayLogger::new();
+    let client_ip = req.headers().get("CF-Connecting-IP").ok().flatten();
+
+    let path = req.path();
+    let path_trimmed = path.trim_start_matches('/');
+
+    let (package, version) = match parse_tarball_path(path_trimmed) {
+        Some(result) => result,
+        None => {
+            return make_error_response(
+                &json!({
+                    "error": "Invalid tarball path format",
+                    "expected": "/{package}/-/{package}-{version}.tgz",
+                    "got": path
+                }),
+                400,
+            );
+        }
+    };
+
+    let metadata = match fetch_package_metadata(&package, &config.npm_registry).await {
+        Ok(m) => m,
+        Err(resp) => return Ok(resp),
+    };
+
+    let time_value = match metadata.get("time") {
+        Some(t) => t.clone(),
+        None => {
+            return make_error_response(
+                &json!({
+                    "error": "Unable to determine version age",
+                    "details": "Package metadata does not contain a valid 'time' field"
+                }),
+                500,
+            );
+        }
+    };
+
+    let time_info = match checker.parse_time_field(&time_value) {
+        Ok(info) => info,
+        Err(e) => {
+            return make_error_response(
+                &json!({
+                    "error": "Failed to parse version timing information",
+                    "details": e.to_string()
+                }),
+                500,
+            );
+        }
+    };
+
+    match checker.resolve_version(&version, &time_info) {
+        Ok(VersionCheckResult::Allowed) => {
+            let upstream_url = format!(
+                "{}/{}/-/{}-{}.tgz",
+                config.npm_download_registry,
+                package,
+                extract_tarball_filename(&package),
+                version
+            );
+            proxy_upstream(&upstream_url, None).await
+        }
+        Ok(VersionCheckResult::Downgraded {
+            suggested_version, ..
+        }) => {
+            let upstream_url = format!(
+                "{}/{}/-/{}-{}.tgz",
+                config.npm_download_registry,
+                package,
+                extract_tarball_filename(&package),
+                suggested_version
+            );
+
+            logger.log_downgraded(
+                PackageType::Npm,
+                &package,
+                &version,
+                &suggested_version,
+                "Version too recent, auto-downgraded for security",
+                client_ip.as_deref(),
+            );
+
+            let mut headers = Headers::new();
+            headers.set("X-Delay-Original-Version", &version)?;
+            headers.set("X-Delay-Redirected-Version", &suggested_version)?;
+            headers.set(
+                "X-Delay-Reason",
+                "Version too recent, auto-downgraded for security",
+            )?;
+
+            proxy_upstream(&upstream_url, Some(&headers)).await
+        }
+        Ok(VersionCheckResult::Denied { .. }) => make_error_response(
+            &json!({
+                "error": "Version too recent for download",
+                "package": package,
+                "requested_version": version,
+                "reason": format!(
+                    "Version was published within the last {} day(s)",
+                    checker.delay_days()
+                )
+            }),
+            403,
+        ),
+        Err(DelayCheckError::VersionNotFound { .. }) => make_error_response(
+            &json!({
+                "error": "Version not found in package metadata",
+                "package": package,
+                "version": version
+            }),
+            404,
+        ),
+        Err(e) => make_error_response(
+            &json!({
+                "error": "Delay check failed",
+                "details": e.to_string()
+            }),
+            500,
+        ),
+    }
+}
+
+fn parse_tarball_path(path: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = path.split('/').collect();
+
+    if parts.len() < 3 || *parts.get(1)? != "-" {
+        return None;
+    }
+
+    let package = parts.first()?.to_string();
+    let filename = parts.last()?.to_string();
+
+    if !filename.ends_with(".tgz") {
+        return None;
+    }
+
+    let without_ext = &filename[..filename.len() - 4];
+    let prefix = format!("{}-", package.replace('/', "%2f"));
+
+    if !without_ext.starts_with(&prefix) {
+        return None;
+    }
+
+    let version = without_ext[prefix.len()..].to_string();
+    Some((package, version))
+}
+
+fn extract_tarball_filename(package: &str) -> &str {
+    if package.starts_with('@') {
+        package
+            .rfind('/')
+            .map(|pos| &package[pos + 1..])
+            .unwrap_or(package)
+    } else {
+        package
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1178,154 @@ mod tests {
             extract_version_from_filename("@scope/pkg-name-1.2.3.tgz"),
             Some("1.2.3".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_tarball_path_valid() {
+        let result = parse_tarball_path("lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(result, Some(("lodash".to_string(), "4.17.21".to_string())));
+    }
+
+    #[test]
+    fn test_parse_tarball_path_scoped_package() {
+        let result = parse_tarball_path("@types/node/-/node-20.0.0.tgz");
+        assert_eq!(result, Some(("@types/node".to_string(), "20.0.0".to_string())));
+    }
+
+    #[test]
+    fn test_parse_tarball_path_invalid_no_dash_dir() {
+        let result = parse_tarball_path("lodash/4.17.21.tgz");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_tarball_path_invalid_no_tgz() {
+        let result = parse_tarball_path("lodash/-/lodash-4.17.21.tar");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_tarball_path_invalid_empty() {
+        assert_eq!(parse_tarball_path(""), None);
+        assert_eq!(parse_tarball_path("/"), None);
+    }
+
+    #[test]
+    fn test_parse_tarball_path_invalid_prefix_mismatch() {
+        let result = parse_tarball_path("lodash/-/other-package-4.17.21.tgz");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_tarball_filename_scoped() {
+        assert_eq!(extract_tarball_filename("@types/node"), "node");
+        assert_eq!(extract_tarball_filename("@scope/pkg-name"), "pkg-name");
+    }
+
+    #[test]
+    fn test_extract_tarball_filename_unscoped() {
+        assert_eq!(extract_tarball_filename("lodash"), "lodash");
+        assert_eq!(extract_tarball_filename("react-dom"), "react-dom");
+    }
+
+    #[test]
+    fn test_extract_tarball_filename_no_slash() {
+        assert_eq!(extract_tarball_filename("@noslash"), "@noslash");
+    }
+
+    #[test]
+    fn test_find_latest_version_basic() {
+        let versions = vec![
+            "1.0.0".to_string(),
+            "2.0.0".to_string(),
+            "0.5.0".to_string(),
+        ];
+        assert_eq!(find_latest_version(&versions), Some("2.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_find_latest_version_empty() {
+        assert_eq!(find_latest_version(&[]), None);
+    }
+
+    #[test]
+    fn test_find_latest_version_single() {
+        let versions = vec!["1.0.0".to_string()];
+        assert_eq!(find_latest_version(&versions), Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_find_latest_version_with_prerelease() {
+        let versions = vec![
+            "1.0.0-beta".to_string(),
+            "1.0.0-rc.1".to_string(),
+            "0.9.0".to_string(),
+        ];
+        assert_eq!(find_latest_version(&versions), Some("0.9.0".to_string()));
+    }
+
+    #[test]
+    fn test_rewrite_tarball_urls_scoped_package() {
+        let mut metadata = json!({
+            "name": "@scope/package",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@scope/package/-/package-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+
+        rewrite_tarball_urls(
+            &mut metadata,
+            "http://localhost:8787",
+            "https://registry.npmjs.org",
+        );
+
+        let tarball = metadata
+            .get("versions")
+            .unwrap()
+            .get("1.0.0")
+            .unwrap()
+            .get("dist")
+            .unwrap()
+            .get("tarball")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(tarball, "http://localhost:8787/dl/@scope/package@1.0.0");
+    }
+
+    #[test]
+    fn test_filter_versions_by_delay_no_time_field() {
+        let checker = DelayChecker::default();
+        let mut metadata = json!({
+            "name": "no-time",
+            "versions": { "1.0.0": {} }
+        });
+        let result = filter_versions_by_delay(&mut metadata, &checker);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_filter_versions_by_delay_preserves_name() {
+        let checker = DelayChecker::new(365);
+        let now = Utc::now();
+        let mut metadata = json!({
+            "name": "preserve-name-pkg",
+            "description": "should be preserved",
+            "versions": {
+                "1.0.0": { "version": "1.0.0" }
+            },
+            "time": {
+                "created": (now - Duration::days(100)).to_rfc3339(),
+                "modified": (now - Duration::days(10)).to_rfc3339(),
+                "1.0.0": (now - Duration::days(100)).to_rfc3339()
+            }
+        });
+        filter_versions_by_delay(&mut metadata, &checker).unwrap();
+        assert_eq!(metadata.get("name").unwrap().as_str().unwrap(), "preserve-name-pkg");
+        assert_eq!(metadata.get("description").unwrap().as_str().unwrap(), "should be preserved");
     }
 }

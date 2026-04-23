@@ -1,0 +1,11 @@
+[project]
+name = "cf-bench"
+version = "0.1.0"
+description = "Cloudflare Workers delayMirror benchmark tool"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0",
+]
+
+[project.scripts]
+cf-bench = "benchmark:main"

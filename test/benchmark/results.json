@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-04-06T18:06:36Z",
+  "target": "https://delay-mirror.fz-sec.workers.dev",
+  "platform": "cloudflare-workers",
+  "results": {
+    "npm": {
+      "name": "npm",
+      "direct_total": 2.455,
+      "proxy_total": 1771.273,
+      "overhead_sec": 1768.818,
+      "overhead_pct": 72049.6,
+      "packages": [
+        {
+          "name": "lodash",
+          "direct_sec": 0.456,
+          "proxy_sec": 590.323,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "express",
+          "direct_sec": 1.218,
+          "proxy_sec": 590.302,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "axios",
+          "direct_sec": 0.781,
+          "proxy_sec": 590.648,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        }
+      ]
+    },
+    "pip": {
+      "name": "pip",
+      "direct_total": 4.759,
+      "proxy_total": 294.22,
+      "overhead_sec": 289.461,
+      "overhead_pct": 6082.4,
+      "packages": [
+        {
+          "name": "numpy",
+          "direct_sec": 1.903,
+          "proxy_sec": 98.062,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "requests",
+          "direct_sec": 1.133,
+          "proxy_sec": 98.062,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "flask",
+          "direct_sec": 1.723,
+          "proxy_sec": 98.096,
+          "direct_status": "ok",
+          "proxy_status": "exit_1"
+        }
+      ]
+    },
+    "gomod": {
+      "name": "gomod",
+      "direct_total": 0.057,
+      "proxy_total": 0.02,
+      "overhead_sec": -0.037,
+      "overhead_pct": -64.9,
+      "packages": [
+        {
+          "name": "github.com/gin-gonic/gin",
+          "direct_sec": 0.043,
+          "proxy_sec": 0.008,
+          "direct_status": "exit_1",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "github.com/go-chi/chi/v5",
+          "direct_sec": 0.007,
+          "proxy_sec": 0.006,
+          "direct_status": "exit_1",
+          "proxy_status": "exit_1"
+        },
+        {
+          "name": "github.com/golang/mock",
+          "direct_sec": 0.007,
+          "proxy_sec": 0.006,
+          "direct_status": "exit_1",
+          "proxy_status": "exit_1"
+        }
+      ]
+    }
+  }
+}

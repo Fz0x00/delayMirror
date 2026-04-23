@@ -1,4 +1,5 @@
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc, Datelike, Timelike};
+use pep440_rs::Version;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -242,10 +243,15 @@ impl DelayChecker {
     }
 }
 
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let a_parts: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-    let b_parts: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-    a_parts.cmp(&b_parts)
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse_pep440 = |v: &str| -> Option<Version> {
+        let v = v.strip_prefix('v').unwrap_or(v);
+        v.parse().ok()
+    };
+    match (parse_pep440(a), parse_pep440(b)) {
+        (Some(va), Some(vb)) => va.cmp(&vb),
+        _ => a.cmp(b),
+    }
 }
 
 pub fn parse_datetime_flexible(time_str: &str) -> Result<DateTime<Utc>, DelayCheckError> {
@@ -594,13 +600,51 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_versions_with_prerelease() {
-        let result = compare_versions("1.0.0-beta", "1.0.0-alpha");
-        let ordering = match (result, compare_versions("1.0.0-beta", "1.0.0-alpha")) {
-            (std::cmp::Ordering::Equal, _) => std::cmp::Ordering::Equal,
-            _ => result,
-        };
-        let _ = ordering;
+    fn test_compare_versions_prerelease_beta_gt_alpha() {
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-beta"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta", "1.0.0-alpha"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_prerelease_release_gt_rc() {
+        assert_eq!(
+            compare_versions("1.0.0-rc.1", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_v_prefix() {
+        assert_eq!(
+            compare_versions("v1.0.0", "v2.0.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("v2.0.0", "v1.0.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("v1.0.0", "v1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("v1.0.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "v2.0.0"),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
@@ -687,5 +731,322 @@ mod tests {
             .num_seconds()
             .abs();
         assert!(diff < 2, "Threshold should be approximately 5 days ago");
+    }
+
+    #[test]
+    fn test_pep440_prerelease_ordering() {
+        assert_eq!(
+            compare_versions("1.0a1", "1.0"),
+            std::cmp::Ordering::Less,
+            "alpha < release"
+        );
+        assert_eq!(
+            compare_versions("1.0b1", "1.0rc1"),
+            std::cmp::Ordering::Less,
+            "beta < rc"
+        );
+        assert_eq!(
+            compare_versions("1.0rc1", "1.0"),
+            std::cmp::Ordering::Less,
+            "rc < release"
+        );
+        assert_eq!(
+            compare_versions("1.0", "1.0.post1"),
+            std::cmp::Ordering::Less,
+            "release < post"
+        );
+    }
+
+    #[test]
+    fn test_pep440_dev_ordering() {
+        assert_eq!(
+            compare_versions("1.0.dev1", "1.0"),
+            std::cmp::Ordering::Less,
+            "dev < release"
+        );
+    }
+
+    #[test]
+    fn test_pep440_epoch() {
+        assert_eq!(
+            compare_versions("1!1.0", "2.0"),
+            std::cmp::Ordering::Greater,
+            "epoch 1 > no epoch"
+        );
+        assert_eq!(
+            compare_versions("2!1.0", "1!99.0"),
+            std::cmp::Ordering::Greater,
+            "epoch 2 > epoch 1"
+        );
+    }
+
+    #[test]
+    fn test_pep440_plain_numeric_backward_compat() {
+        assert_eq!(compare_versions("1.0.0", "2.0.0"), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_versions("2.3.4", "2.3.3"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("1.10.0", "1.9.0"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_pep440_find_eligible_with_prerelease() {
+        let checker = DelayChecker::new(30);
+        let now = Utc::now();
+        let time_json = json!({
+            "1.0a1": (now - Duration::days(100)).to_rfc3339(),
+            "1.0b1": (now - Duration::days(80)).to_rfc3339(),
+            "1.0rc1": (now - Duration::days(60)).to_rfc3339(),
+            "1.0": (now - Duration::days(5)).to_rfc3339(),
+            "2.0a1": (now - Duration::days(1)).to_rfc3339()
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        let result = checker.find_eligible_version("2.0a1", &info).unwrap();
+        assert_eq!(
+            result,
+            Some("1.0rc1".to_string()),
+            "should pick highest prerelease among eligible"
+        );
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_rfc3339_with_timezone_offset() {
+        let result = parse_datetime_flexible("2024-06-15T10:30:00+08:00");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 6);
+        assert_eq!(dt.day(), 15);
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_rfc3339_with_z() {
+        let result = parse_datetime_flexible("2024-01-01T00:00:00Z");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2024);
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_iso_no_timezone() {
+        let result = parse_datetime_flexible("2024-03-15T14:30:00");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 3);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 14);
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_with_microseconds() {
+        let result = parse_datetime_flexible("2024-06-01T12:00:00.123456");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_space_separator() {
+        let result = parse_datetime_flexible("2024-06-01 12:00:00");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 6);
+        assert_eq!(dt.day(), 1);
+        assert_eq!(dt.hour(), 12);
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_invalid_empty() {
+        let result = parse_datetime_flexible("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_invalid_gibberish() {
+        let result = parse_datetime_flexible("not-a-date-at-all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_invalid_partial() {
+        let result = parse_datetime_flexible("2024-01-01");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_flexible_negative_timezone() {
+        let result = parse_datetime_flexible("2024-12-31T23:59:59-05:00");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_delay_check_error_display() {
+        let err = DelayCheckError::InvalidTimeFormat("bad format".to_string());
+        assert_eq!(format!("{}", err), "Invalid time field format: bad format");
+
+        let err = DelayCheckError::MissingTimeField;
+        assert_eq!(format!("{}", err), "Missing time field in metadata");
+
+        let err = DelayCheckError::VersionNotFound {
+            version: "1.0.0".to_string(),
+        };
+        assert_eq!(format!("{}", err), "Version '1.0.0' not found in metadata");
+
+        let err = DelayCheckError::NoEligibleVersions;
+        assert_eq!(
+            format!("{}", err),
+            "No eligible versions available after delay check"
+        );
+
+        let err = DelayCheckError::InvalidDelayDays("-1".to_string());
+        assert_eq!(format!("{}", err), "Invalid DELAY_DAYS value: -1");
+    }
+
+    #[test]
+    fn test_delay_check_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DelayCheckError>();
+    }
+
+    #[test]
+    fn test_version_check_result_equality() {
+        let now = Utc::now();
+        assert_eq!(VersionCheckResult::Allowed, VersionCheckResult::Allowed);
+
+        let denied1 = VersionCheckResult::Denied {
+            publish_time: now,
+        };
+        let denied2 = VersionCheckResult::Denied {
+            publish_time: now,
+        };
+        assert_eq!(denied1, denied2);
+
+        let down1 = VersionCheckResult::Downgraded {
+            original_version: "2.0.0".to_string(),
+            suggested_version: "1.0.0".to_string(),
+            original_time: now,
+            suggested_time: now - Duration::days(1),
+        };
+        let down2 = VersionCheckResult::Downgraded {
+            original_version: "2.0.0".to_string(),
+            suggested_version: "1.0.0".to_string(),
+            original_time: now,
+            suggested_time: now - Duration::days(1),
+        };
+        assert_eq!(down1, down2);
+    }
+
+    #[test]
+    fn test_version_check_result_inequality() {
+        let now = Utc::now();
+        assert_ne!(
+            VersionCheckResult::Allowed,
+            VersionCheckResult::Denied {
+                publish_time: now
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_version_with_single_version_old() {
+        let checker = DelayChecker::new(3);
+        let now = Utc::now();
+        let time_json = json!({
+            "1.0.0": (now - Duration::days(100)).to_rfc3339()
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        let result = checker.resolve_version("1.0.0", &info).unwrap();
+        assert_eq!(result, VersionCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_resolve_version_with_single_version_new() {
+        let checker = DelayChecker::new(365);
+        let now = Utc::now();
+        let time_json = json!({
+            "1.0.0": (now - Duration::days(1)).to_rfc3339()
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        let result = checker.resolve_version("1.0.0", &info).unwrap();
+        match result {
+            VersionCheckResult::Denied { .. } => {}
+            other => panic!("Expected Denied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_find_eligible_version_with_many_versions() {
+        let checker = DelayChecker::new(30);
+        let now = Utc::now();
+        let time_json = json!({
+            "1.0.0": (now - Duration::days(200)).to_rfc3339(),
+            "1.1.0": (now - Duration::days(150)).to_rfc3339(),
+            "1.2.0": (now - Duration::days(100)).to_rfc3339(),
+            "1.3.0": (now - Duration::days(50)).to_rfc3339(),
+            "1.4.0": (now - Duration::days(20)).to_rfc3339(),
+            "1.5.0": (now - Duration::days(5)).to_rfc3339(),
+            "2.0.0": (now - Duration::days(1)).to_rfc3339()
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        let result = checker.find_eligible_version("2.0.0", &info).unwrap();
+        assert_eq!(result, Some("1.4.0".to_string()));
+    }
+
+    #[test]
+    fn test_compare_versions_non_numeric_fallback() {
+        // When pep440 parsing fails, fall back to string comparison
+        assert_eq!(
+            compare_versions("abc", "def"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("xyz", "abc"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("same", "same"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_parse_time_field_with_single_version() {
+        let checker = DelayChecker::default();
+        let time_json = json!({
+            "1.0.0": "2024-01-01T00:00:00Z"
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        assert_eq!(info.len(), 1);
+        assert!(info.get_publish_time("1.0.0").is_some());
+    }
+
+    #[test]
+    fn test_parse_time_field_with_many_versions_sorted() {
+        let checker = DelayChecker::default();
+        let time_json = json!({
+            "created": "2020-01-01T00:00:00Z",
+            "modified": "2024-12-31T23:59:59Z",
+            "0.1.0": "2020-01-15T00:00:00Z",
+            "0.2.0": "2020-03-20T00:00:00Z",
+            "1.0.0": "2021-01-01T00:00:00Z",
+            "1.1.0": "2021-06-15T00:00:00Z",
+            "2.0.0": "2022-01-01T00:00:00Z",
+            "2.1.0": "2022-08-01T00:00:00Z",
+            "3.0.0": "2023-01-01T00:00:00Z"
+        });
+        let info = checker.parse_time_field(&time_json).unwrap();
+        // BTreeMap should keep keys sorted
+        let versions: Vec<&String> = info.versions().collect();
+        assert_eq!(versions.len(), 7);
+        assert_eq!(versions[0], "0.1.0");
+        assert_eq!(versions[6], "3.0.0");
     }
 }
